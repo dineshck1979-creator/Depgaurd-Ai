@@ -1,0 +1,6 @@
+{
+  "name": "DepGuard AI",
+  "description": "Dependency verification tool for AI-generated Python and JavaScript code by team Neural Nexus.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
