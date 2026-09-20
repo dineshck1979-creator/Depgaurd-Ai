@@ -32,7 +32,7 @@ export interface ExtractedDependency {
   evidence: {
     lineNumber: number;
     rawLine: string;
-    statementType: 'import' | 'from-import' | 'require' | 'side-effect-import';
+    statementType: 'import' | 'from-import' | 'require' | 'side-effect-import' | 'dynamic-import' | 'export-from';
   };
   isStandardLibrary?: boolean;
   registryMetadata?: RegistryMetadata;

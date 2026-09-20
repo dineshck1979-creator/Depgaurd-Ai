@@ -39,10 +39,10 @@ export const PYTHON_STANDARD_LIBS = new Set([
 export const NODE_STANDARD_LIBS = new Set([
   'assert', 'async_hooks', 'buffer', 'child_process', 'cluster', 'console', 'constants',
   'crypto', 'dgram', 'diagnostics_channel', 'dns', 'domain', 'events', 'fs', 'fs/promises',
-  'http', 'http2', 'https', 'inspector', 'module', 'net', 'os', 'path', 'perf_hooks',
-  'process', 'punycode', 'querystring', 'readline', 'repl', 'stream', 'string_decoder',
-  'timers', 'tls', 'trace_events', 'tty', 'url', 'util', 'v8', 'vm', 'wasi', 'worker_threads',
-  'zlib'
+  'http', 'http2', 'https', 'inspector', 'module', 'net', 'os', 'path', 'path/posix', 'path/win32',
+  'perf_hooks', 'process', 'punycode', 'querystring', 'readline', 'readline/promises', 'repl',
+  'stream', 'stream/promises', 'stream/web', 'string_decoder', 'test', 'timers', 'timers/promises',
+  'tls', 'trace_events', 'tty', 'url', 'util', 'v8', 'vm', 'wasi', 'worker_threads', 'zlib', 'sqlite'
 ]);
 
 /**
@@ -183,10 +183,14 @@ export function extractPythonDependencies(code: string): ExtractedDependency[] {
  * Extracts JavaScript / TypeScript dependencies from source code
  * Supports:
  * - import package from "package"
- * - import "package"
- * - require("package")
- * - import { a } from "package"
- * - Ignores relative/local imports such as ./utils, ../components, /root, @/
+ * - import { a, b } from "package" (including multi-line destructuring)
+ * - import * as pkg from "package"
+ * - import type { X } from "package"
+ * - import "package" (side-effect imports)
+ * - require("package") (including inside functions, classes, and callbacks)
+ * - await import("package") / dynamic import("package")
+ * - export { a } from "package" / export * from "package"
+ * - Ignores relative/local imports such as ./utils, ../components, /root, @/, ~/
  */
 export function extractJavaScriptDependencies(code: string): ExtractedDependency[] {
   const lines = code.split(/\r?\n/);
@@ -194,18 +198,21 @@ export function extractJavaScriptDependencies(code: string): ExtractedDependency
   const seenPackages = new Set<string>();
 
   const isLocalOrRelative = (specifier: string): boolean => {
+    const s = specifier.trim();
     return (
-      specifier.startsWith('./') ||
-      specifier.startsWith('../') ||
-      specifier.startsWith('/') ||
-      specifier.startsWith('~/') ||
-      specifier.startsWith('@/')
+      s.startsWith('./') ||
+      s.startsWith('../') ||
+      s.startsWith('/') ||
+      s.startsWith('~/') ||
+      s.startsWith('@/') ||
+      s.startsWith('.\\') ||
+      s.startsWith('..\\')
     );
   };
 
   const cleanPackageName = (specifier: string): string => {
-    // Strip `node:` prefix if present (e.g. node:fs -> fs)
     let cleaned = specifier.trim();
+    // Strip node: protocol prefix if present (e.g. node:fs -> fs)
     if (cleaned.startsWith('node:')) {
       cleaned = cleaned.slice(5);
     }
@@ -223,120 +230,99 @@ export function extractJavaScriptDependencies(code: string): ExtractedDependency
     return cleaned.split('/')[0];
   };
 
+  const getLineInfo = (index: number) => {
+    const upTo = code.slice(0, index);
+    const lineNum = upTo.split(/\r?\n/).length;
+    const rawLine = lines[lineNum - 1] || '';
+    return { lineNum, rawLine };
+  };
+
+  const addPackage = (
+    rawSpecifier: string,
+    matchIndex: number,
+    statementType: 'import' | 'require' | 'dynamic-import' | 'side-effect-import' | 'export-from',
+    originalText: string
+  ) => {
+    if (!rawSpecifier || isLocalOrRelative(rawSpecifier)) return;
+
+    const pkgName = cleanPackageName(rawSpecifier);
+    if (!pkgName || pkgName === '.' || pkgName === '..') return;
+
+    const isStdLib = NODE_STANDARD_LIBS.has(pkgName);
+    const { lineNum, rawLine } = getLineInfo(matchIndex);
+    const dedupeKey = `${pkgName}:${lineNum}`;
+
+    if (!seenPackages.has(dedupeKey)) {
+      seenPackages.add(dedupeKey);
+      results.push({
+        id: `js-${lineNum}-${pkgName}`,
+        importName: rawSpecifier,
+        packageName: pkgName,
+        originalImport: originalText.trim().replace(/\s+/g, ' '),
+        isNormalized: false,
+        ecosystem: 'npm',
+        status: isStdLib ? 'REVIEW REQUIRED' : 'UNVERIFIED',
+        reviewReason: isStdLib ? 'Built-in Node.js module.' : undefined,
+        evidence: {
+          lineNumber: lineNum,
+          rawLine: rawLine.trim(),
+          statementType,
+        },
+        isStandardLibrary: isStdLib,
+      });
+    }
+  };
+
+  // 1. Dynamic imports: import("pkg") or await import("pkg") - works inside functions
+  const dynamicImportRegex = /import\s*\(\s*['"`]([^'"`]+)['"`]\s*\)/g;
+  let m: RegExpExecArray | null;
+  while ((m = dynamicImportRegex.exec(code)) !== null) {
+    addPackage(m[1], m.index, 'dynamic-import', m[0]);
+  }
+
+  // 2. CommonJS require: require("pkg") - works at top-level or inside functions
+  const requireRegex = /require\s*\(\s*['"`]([^'"`]+)['"`]\s*\)/g;
+  while ((m = requireRegex.exec(code)) !== null) {
+    addPackage(m[1], m.index, 'require', m[0]);
+  }
+
+  // 3. Static ES Imports with `from`:
+  // Handles single-line and multi-line destructured imports:
+  // import {
+  //   useState,
+  //   useEffect
+  // } from "react";
+  const importFromRegex = /import\s+(?:type\s+)?(?:[\w*\s$,]+|\{[\s\S]*?\})\s+from\s+['"`]([^'"`]+)['"`]/g;
+  while ((m = importFromRegex.exec(code)) !== null) {
+    addPackage(m[1], m.index, 'import', m[0]);
+  }
+
+  // 4. Side-effect direct imports: import "package" or import 'package'
+  const sideEffectRegex = /import\s+['"`]([^'"`]+)['"`]/g;
+  while ((m = sideEffectRegex.exec(code)) !== null) {
+    addPackage(m[1], m.index, 'side-effect-import', m[0]);
+  }
+
+  // 5. ES Re-exports: export { x } from "pkg" or export * from "pkg"
+  const exportFromRegex = /export\s+(?:[\w*\s$,]+|\{[\s\S]*?\})\s+from\s+['"`]([^'"`]+)['"`]/g;
+  while ((m = exportFromRegex.exec(code)) !== null) {
+    addPackage(m[1], m.index, 'export-from', m[0]);
+  }
+
+  // 6. Line-by-line fallback for loose statements or user prompt variations
   lines.forEach((rawLine, index) => {
-    const lineNumber = index + 1;
     const line = rawLine.trim();
+    if (!line || line.startsWith('//') || line.startsWith('/*') || line.startsWith('*')) return;
 
-    // Skip empty lines or single-line comments
-    if (!line || line.startsWith('//') || line.startsWith('/*')) {
-      return;
-    }
-
-    // 1. require("package") or require('package')
-    // Matches: const x = require("express"); or require('totally-fake-package-928374')
-    const requireRegex = /require\s*\(\s*['"`]([^'"`]+)['"`]\s*\)/g;
-    let reqMatch;
-    while ((reqMatch = requireRegex.exec(line)) !== null) {
-      const rawSpecifier = reqMatch[1];
-      if (!isLocalOrRelative(rawSpecifier)) {
-        const pkgName = cleanPackageName(rawSpecifier);
-        const isStdLib = NODE_STANDARD_LIBS.has(pkgName);
-        const dedupeKey = `${pkgName}:${lineNumber}`;
-
-        if (!seenPackages.has(dedupeKey)) {
-          seenPackages.add(dedupeKey);
-          results.push({
-            id: `js-${lineNumber}-${pkgName}`,
-            importName: rawSpecifier,
-            packageName: pkgName,
-            originalImport: line,
-            isNormalized: false,
-            ecosystem: 'npm',
-            status: isStdLib ? 'REVIEW REQUIRED' : 'UNVERIFIED',
-            reviewReason: isStdLib ? 'Built-in Node.js module.' : undefined,
-            evidence: {
-              lineNumber,
-              rawLine,
-              statementType: 'require',
-            },
-            isStandardLibrary: isStdLib,
-          });
-        }
-      }
-    }
-
-    // 2. import ... from "package" / 'package'
-    // Matches: import express from "express";
-    // Matches: import { axios } from 'axios';
-    // Matches: import * as foo from "foo";
-    const importFromRegex = /import\s+[\s\S]*?\s+from\s+['"`]([^'"`]+)['"`]/;
-    const importFromMatch = line.match(importFromRegex);
-    if (importFromMatch) {
-      const rawSpecifier = importFromMatch[1];
-      if (!isLocalOrRelative(rawSpecifier)) {
-        const pkgName = cleanPackageName(rawSpecifier);
-        const isStdLib = NODE_STANDARD_LIBS.has(pkgName);
-        const dedupeKey = `${pkgName}:${lineNumber}`;
-
-        if (!seenPackages.has(dedupeKey)) {
-          seenPackages.add(dedupeKey);
-          results.push({
-            id: `js-${lineNumber}-${pkgName}`,
-            importName: rawSpecifier,
-            packageName: pkgName,
-            originalImport: line,
-            isNormalized: false,
-            ecosystem: 'npm',
-            status: isStdLib ? 'REVIEW REQUIRED' : 'UNVERIFIED',
-            reviewReason: isStdLib ? 'Built-in Node.js module.' : undefined,
-            evidence: {
-              lineNumber,
-              rawLine,
-              statementType: 'import',
-            },
-            isStandardLibrary: isStdLib,
-          });
-        }
-      }
-      return;
-    }
-
-    // 3. Side-effect / direct import: import "package" or import 'package'
-    // Also tolerate prompt typo like `import totally-fake-package-928374";` or `import "totally-fake-package-928374";`
-    const sideEffectMatch = line.match(/^import\s+['"`]([^'"`]+)['"`];?$/) ||
-                            line.match(/^import\s+([a-zA-Z0-9@_.-]+)["']?;?$/);
-    if (sideEffectMatch) {
-      const rawSpecifier = sideEffectMatch[1].replace(/["']/g, '');
-      if (!isLocalOrRelative(rawSpecifier)) {
-        const pkgName = cleanPackageName(rawSpecifier);
-        const isStdLib = NODE_STANDARD_LIBS.has(pkgName);
-        const dedupeKey = `${pkgName}:${lineNumber}`;
-
-        if (!seenPackages.has(dedupeKey)) {
-          seenPackages.add(dedupeKey);
-          results.push({
-            id: `js-${lineNumber}-${pkgName}`,
-            importName: rawSpecifier,
-            packageName: pkgName,
-            originalImport: line,
-            isNormalized: false,
-            ecosystem: 'npm',
-            status: isStdLib ? 'REVIEW REQUIRED' : 'UNVERIFIED',
-            reviewReason: isStdLib ? 'Built-in Node.js module.' : undefined,
-            evidence: {
-              lineNumber,
-              rawLine,
-              statementType: 'side-effect-import',
-            },
-            isStandardLibrary: isStdLib,
-          });
-        }
-      }
-      return;
+    // Match loose: import package_name without quotes
+    const looseMatch = line.match(/^import\s+([a-zA-Z0-9@_.-]+);?$/);
+    if (looseMatch && !looseMatch[1].startsWith('from')) {
+      const lineIndex = code.indexOf(rawLine);
+      addPackage(looseMatch[1], lineIndex >= 0 ? lineIndex : 0, 'side-effect-import', line);
     }
   });
 
-  return results;
+  return results.sort((a, b) => a.evidence.lineNumber - b.evidence.lineNumber);
 }
 
 /**
@@ -365,9 +351,20 @@ from .local_utils import helper_function
 export const JAVASCRIPT_EXAMPLE = `// AI-generated JavaScript snippet (Neural Nexus DepGuard Test)
 import express from "express";
 import axios from "axios";
+import {
+  useState,
+  useEffect
+} from "react";
 import "totally-fake-package-928374";
-const lodash = require("lodash");
-import { useState, useEffect } from "react";
+
+// Function with dynamic require and local module
+function processData() {
+  const lodash = require("lodash");
+  return lodash.compact([1, 0, false, 2]);
+}
+
+// Subpath & Relative imports
+import get from "lodash/get";
 import { formatData } from "./utils/helpers";
 import ComponentA from "../components/ComponentA";
 `;
